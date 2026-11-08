@@ -3,7 +3,7 @@
     "manifestVersion": 2,
     "name": "Sukebei",
     "id": "sukebeitorrent.sukebei",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "type": "torrent",
     "accuracy": "medium",
     "updatePeers": false,
@@ -15,7 +15,7 @@
     "nsfw": true,
     "url": "aHR0cHM6Ly9zdWtlYmVpLm55YWEuc2k=",
     "description": "Searches sukebei.nyaa.si (Art - Anime) directly for adult anime torrents. Matches Latin and Japanese titles, reads 第N話 / 第N巻 / #N episode markers.",
-    "icon": "https://sukebei.nyaa.si/static/favicon.png",
+    "icon": "https://nyaa.si/static/favicon.png",
     "update": "https://raw.githubusercontent.com/Luna0005/sukebeitorrent/main/hayase/index.json",
     "code": "https://raw.githubusercontent.com/Luna0005/sukebeitorrent/main/dist/sukebei.js"
   }

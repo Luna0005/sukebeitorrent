@@ -2,7 +2,7 @@
   {
     "name": "Sukebei",
     "id": "sukebeitorrent.sukebei",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "type": "torrent",
     "accuracy": "medium",
     "ratio": 0,
@@ -10,7 +10,7 @@
     "languages": [
       "ALL"
     ],
-    "icon": "https://sukebei.nyaa.si/static/favicon.png",
+    "icon": "https://nyaa.si/static/favicon.png",
     "description": "Searches sukebei.nyaa.si directly for adult anime torrents.",
     "update": "https://raw.githubusercontent.com/Luna0005/sukebeitorrent/main/shiru/index.json",
     "code": "https://raw.githubusercontent.com/Luna0005/sukebeitorrent/main/dist/sukebei.js"
