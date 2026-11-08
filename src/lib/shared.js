@@ -1,0 +1,1194 @@
+import { aliasTitles } from './aliases.js'
+
+// Shared matching, query, and torrent helpers used by every source.
+// Single source of truth: fix matching logic here once, all sources inherit it.
+
+// sukebei.nyaa.si (like nyaa.si) sits behind ddos-guard, which serves a challenge page (not RSS) to
+// clients that do not look like a browser. A plain fetch() with no User-Agent
+// gets challenged in some host environments, so the response has no <item> and
+// the source returns nothing. Sending browser-like headers gets past it. In a
+// real browser/worker, User-Agent is a forbidden header and is silently
+// ignored (the browser sets its own), so this is safe everywhere.
+export const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  Accept: 'application/xml, text/xml, text/html, application/json, */*'
+}
+
+export function httpGet (url, opts = {}) {
+  const { headers, ...rest } = opts
+  return fetch(url, { headers: { ...BROWSER_HEADERS, ...headers }, ...rest })
+}
+
+// test() runs on Hayase launch and Hayase kills it with a generic "Extension
+// check timed out" toast if it hasn't returned in about ten seconds. We beat
+// that with our own 6s abort so we can throw a specific, non-scary message
+// telling the user what is actually going on and that no reinstall is needed.
+export async function checkFeed (url, host = 'sukebei.nyaa.si') {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 6000)
+  let res
+  try {
+    res = await httpGet(url, { signal: ctrl.signal })
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(host + ' is slow to respond right now. This is temporary and usually clears in a minute. Searches will still work; the extension is fine, no reinstall needed.')
+    }
+    throw new Error(host + ' is currently unreachable. The extension will work again once the site is back, nothing to fix on your end.')
+  } finally {
+    clearTimeout(timer)
+  }
+  if (res.status === 429) {
+    throw new Error(host + ' is rate-limiting requests. Wait a minute and toggle this extension off and on.')
+  }
+  if (!res.ok) {
+    throw new Error(host + ' returned HTTP ' + res.status + '. The extension will work again once the site is back.')
+  }
+  const text = await res.text()
+  if (!text.includes('<rss') && !text.includes('<item>')) {
+    throw new Error(host + ' returned an unexpected response (likely a ddos-guard challenge). Try again in a minute; the extension will keep working when it clears.')
+  }
+  return true
+}
+
+export const TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.stealth.si:80/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://tracker.coppersurfer.tk:6969/announce',
+  'udp://tracker.openbittorrent.com:6969/announce',
+  'http://sukebei.tracker.wf:8888/announce'
+]
+
+export const BATCH_PATTERNS = [
+  /\bbatch\b/i,
+  /\bcomplete\b/i,
+  /\bseason\s*\d+\b/i,
+  /\bs\d{1,2}\b(?!\s*e\d)/i,
+  /\b\d{1,3}\s*[-~]\s*\d{1,3}\b/
+]
+
+export const STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'this', 'that', 'her', 'his',
+  'are', 'was', 'were', 'has', 'have', 'had', 'who', 'what', 'when',
+  'where', 'why', 'how', 'all', 'any', 'one', 'two', 'season',
+  'episode', 'part', 'arc', 'movie', 'film', 'ova', 'special',
+  // Japanese romanization noise: grammatical particles, pronouns, honorifics,
+  // copula, common verbs, and arc/chapter markers that romanize to short tokens
+  // and appear across unrelated shows ("-hen" arc suffix, "na Ken", "boku/ore"
+  // pronouns, "-sama/-san/-kun/-chan" honorifics). Never show-identifying.
+  'hen', 'boku', 'ore', 'kimi', 'sama', 'san', 'kun', 'chan', 'suru',
+  'naru', 'nani', 'desu', 'dake', 'made', 'demo', 'inai', 'koi', 'ken', 'shi',
+  // "dan" leaked "Grow Up Show: Himawari no Circus-dan" (Japanese for "troupe")
+  // into every Dandadan search. Dandadan self-match is unaffected because the
+  // canonical title tokens to "dandadan" (14 chars, kept), not "dan".
+  'dan',
+  // Sukebei release noise. "THE ANIMATION" closes half the hentai titles on
+  // AniList, so "animation" alone was enough for unrelated OVAs to clear the
+  // two-hit threshold together with any other shared word.
+  'animation', 'hentai', 'uncensored', 'censored', 'raw', 'subbed', 'dubbed'
+])
+
+// Japanese releases on sukebei mark episodes in ways the Latin-centric matchers
+// below never read: 第3話 / 第3巻 (episode / volume 3), ＃３ in full-width
+// digits, "Vol.2", 前編 / 後編. Every such marker is rewritten into the
+// " - 03 " form the rest of this file already understands. The rewrite is
+// idempotent, so helpers that call it on an already-normalized title are safe.
+const JP_PART = { '前編': 1, '後編': 2, '上巻': 1, '中巻': 2 }
+
+export function normalizeMatchTitle (title) {
+  let t = String(title || '').normalize('NFKC')
+  const ep = (a, b) => ' - ' + pad(parseInt(a, 10)) + (b ? '-' + pad(parseInt(b, 10)) : '') + ' '
+  t = t.replace(/第\s*(\d{1,4})(?:\s*[-~]\s*(\d{1,4}))?\s*[話巻章羽回]/g, (_, a, b) => ep(a, b))
+  t = t.replace(/\bVol(?:ume)?\.?\s*(\d{1,3})(?:\s*[-~]\s*(\d{1,3}))?\b/gi, (_, a, b) => ep(a, b))
+  // "#2" only when it closes the name: "Huge Tits BOMB #2 Beautiful Wife" is a
+  // sequel title, "ヤってみたら#2" and "(OVA シスターブリーダー #5-6)" are episodes.
+  t = t.replace(/#\s*(\d{1,3})(?:\s*[-~]\s*(\d{1,3}))?(?=\s*(?:$|[)\]】）]))/g, (_, a, b) => ep(a, b))
+  t = t.replace(/(前編|後編|上巻|中巻)/g, m => ep(JP_PART[m]))
+  return t
+}
+
+// CJK / kana runs long enough to identify a show. AniList's native title is the
+// only name a Japanese-only raw ("[ピンクパイナップル] 無自覚な幼馴染と…") shares
+// with the show, and the Latin token matcher sees nothing in it at all.
+const CJK_RUN = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]{4,}/g
+
+export function nativeKeys (titles) {
+  const keys = new Set()
+  for (const t of titles || []) {
+    const runs = String(t || '').normalize('NFKC').match(CJK_RUN) || []
+    if (!runs.length) continue
+    keys.add(runs.sort((a, b) => b.length - a.length)[0])
+  }
+  return keys
+}
+
+export function matchesNative (title, keys) {
+  if (!keys || !keys.size) return false
+  const flat = String(title || '').normalize('NFKC').replace(/\s+/g, '')
+  for (const k of keys) if (flat.includes(k)) return true
+  return false
+}
+
+export function escapeQuery (str) {
+  return String(str || '').replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+export function significantTokens (title) {
+  return escapeQuery(title)
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(t => t.length >= 3 && !STOPWORDS.has(t) && !/^\d+(st|nd|rd|th)$/.test(t))
+}
+
+export function buildTitleTokens (titles) {
+  // Word-boundary matching (tokenInTitle) already prevents fragment tokens like
+  // "dan" from matching inside unrelated words like "danganronpa", so no
+  // substring de-duplication is needed (and de-duping wrongly dropped real
+  // words like "toxin" inside the concatenated synonym "marriagetoxin").
+  const tokens = new Set()
+  for (const t of titles || []) {
+    for (const tok of significantTokens(t)) tokens.add(tok)
+  }
+  return tokens
+}
+
+export function tokenInTitle (tok, lower) {
+  return new RegExp('\\b' + tok + '\\b').test(lower)
+}
+
+export function stripLangCodes (title) {
+  // Multi-sub release groups (Erai-raws etc.) append a long run of bracketed
+  // language/region codes: [ENG][POR-BR][SPA-LA][DAN][CHI]... These are file
+  // metadata, not part of the show name, yet "[DAN]" matches the token "dan"
+  // (from "DAN DA DAN") via word boundaries and pulled Ranma/Ao no Hako into
+  // Dandadan results. Strip all-caps 2-3 letter bracket codes before matching.
+  return String(title).replace(/\[[A-Z]{2,3}(?:-[A-Z]{2,3})?\]/g, ' ')
+}
+
+// The part of a filename that names the show: the group tag is dropped and
+// everything from the episode marker onward is cut, taking the LAST marker so
+// an arc subtitle stays in ("Made in Abyss - Retsujitsu no Ougonkyou - 04").
+export function showNamePart (title) {
+  let t = String(title || '').replace(/^\s*[[(\u3010][^\])\u3011]*[\])\u3011]\s*/, '')
+  const se = t.search(/\bS\d{1,2}E\d{1,4}\b/i)
+  if (se > 0) t = t.slice(0, se)
+  const dash = /[\s._][-~]\s*\d{1,4}(?:v\d)?(?=[\s[(]|$)/gi
+  let last = -1
+  let m
+  while ((m = dash.exec(t)) !== null) last = m.index
+  if (last > 0) t = t.slice(0, last)
+  const epWord = t.search(/\bEP\.?\s*\d{1,4}\b/i)
+  if (epWord > 0) t = t.slice(0, epWord)
+  t = t.split(/[[(]/)[0]
+  return t.trim().replace(/[\s:_-]+$/, '')
+}
+
+// A show whose whole identity is one word is trivially satisfied by any release
+// that happens to contain it: "Another" matched "In Another World With My
+// Smartphone", "Monster" matched "Monster Musume no Oisha-san". For those shows
+// the name in the filename must not introduce a significant word the show does
+// not have, which also separates a season from its own sequel arc.
+export function nameIntroducesForeignWord (title, tokens) {
+  for (const tok of significantTokens(showNamePart(title))) {
+    if (/^\d+$/.test(tok)) continue
+    if (!tokens.has(tok)) return true
+  }
+  return false
+}
+
+export function resultMatchesShow (title, tokens, minHits = 1) {
+  if (!tokens.size) return true
+  const lower = stripLangCodes(title).toLowerCase()
+  let hits = 0
+  for (const tok of tokens) {
+    if (tokenInTitle(tok, lower)) {
+      hits++
+      if (hits >= minHits) return true
+    }
+  }
+  return false
+}
+
+const ROMAN_SEASON = { II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9 }
+
+// Extract a season number from a single title string, or null if none found.
+// Handles "SxxExx", "Season 2", "2nd Season", trailing Roman numeral, trailing
+// digit. Used both to classify the show (from AniList titles) and to classify
+// a torrent result title, so the two can be compared.
+export function detectResultSeason (title) {
+  const t = String(title || '')
+  // "S02E01" (combined) OR "S2 - 08" / "S02" (season marker alone, no episode
+  // appended). Release groups use BOTH conventions: SubsPlease writes "S2 - 08"
+  // and Erai-raws writes similar, while many BD groups write "S02E01". The
+  // earlier regex only caught the SxxExx form and missed the space-separated
+  // one, leaking Season 2 releases into Season 1 searches.
+  let m = t.match(/\bS(\d{1,2})(?:E\d|\b)/i)
+  if (m) return parseInt(m[1], 10)
+  // "Season 2" / "2nd Season" / "3rd Season" / "4th Season"
+  m = t.match(/\b(?:Season\s+(\d+)|(\d+)(?:st|nd|rd|th)\s+Season)\b/i)
+  if (m) return parseInt(m[1] || m[2], 10)
+  // Trailing Roman numeral after a word: "Foo II", "Die Neue These IV"
+  m = t.match(/\b[A-Za-z0-9]+\s+(II|III|IV|V|VI|VII|VIII|IX)(?=\s|:|\.|-|$|\[|\()/)
+  if (m) return ROMAN_SEASON[m[1]]
+  // Trailing single digit 2-9 at end / before delimiter, but SKIP when
+  // preceded by "Part". "Part N" is ambiguous in anime naming: sometimes it
+  // means season number, sometimes a cour within a season (e.g. "BLEACH TYBW
+  // Part 4" is cour 4 of season 1 of the arc but release groups use S17
+  // continuous numbering, not "Part 4"). Detecting "Part N" as a season marker
+  // caused every real release to be rejected. Rest of the pattern is unchanged.
+  const digitRE = /\b([2-9])(?=\s*$|\s*[:\-|(\[])/g
+  let dm
+  while ((dm = digitRE.exec(t)) !== null) {
+    const before = t.slice(Math.max(0, dm.index - 8), dm.index).toLowerCase()
+    if (/\bpart\s+$/.test(before)) continue
+    if (/^-[A-Za-z]/.test(t.slice(dm.index + 1))) continue
+    return parseInt(dm[1], 10)
+  }
+  return null
+}
+
+// Highest season detected across a show's title list. Returns 1 as the default
+// when no season marker is present anywhere (single-season show or unmarked
+// sequel like "Frieren"). We take the max because AniList often lists both the
+// bare franchise name and the season-numbered variant in the same title set,
+// and we want the season-numbered one to win.
+export function detectShowSeason (titles) {
+  let max = 0
+  for (const t of titles || []) {
+    const n = detectResultSeason(t)
+    if (n && n > max) max = n
+  }
+  return max || 1
+}
+
+// True when the result's season is compatible with the searched show.
+// Asymmetric rule reflecting release-group conventions:
+//   - Show is S2+: result MUST carry a matching season marker. Reject anything
+//     with no marker at all (that is almost certainly an older-season release
+//     that just happens to share the show's tokens, e.g. "Youjo Senki - 01"
+//     for a "Youjo Senki II" search).
+//   - Show is S1: reject only results that explicitly claim a higher season
+//     (so "Foo Season 2 - 01" does not leak into a plain "Foo" search).
+//     Bare unmarked results are fine.
+export function seasonMarkerTokens (titles) {
+  const list = titles || []
+  const franchise = new Set()
+  for (const t of list) {
+    const raw = String(t)
+    const colon = raw.indexOf(':')
+    for (const tok of significantTokens(colon > 0 ? raw.slice(0, colon) : raw)) franchise.add(tok)
+  }
+  const marks = new Set()
+  for (const t of list) {
+    const raw = String(t)
+    if (detectResultSeason(raw) != null) continue
+    const colon = raw.indexOf(':')
+    if (colon <= 0) continue
+    if (!significantTokens(raw.slice(0, colon)).length) continue
+    for (const tok of significantTokens(raw.slice(colon + 1))) {
+      if (!franchise.has(tok)) marks.add(tok)
+    }
+  }
+  return marks
+}
+
+// chainSeason comes from counting the show's prequels and is only ever used to
+// accept, never to reject. An arc-titled sequel states no number of its own, so
+// the detector falls back to season 1 and threw away the releases that label it
+// correctly: Tokyo Revengers: Santen Sensou-hen is the fourth season and every
+// group tagged it S04.
+export function resultMatchesSeason (title, showSeason, markerTokens, chainSeason) {
+  const rs = detectResultSeason(title)
+  if (chainSeason && chainSeason > 1 && rs === chainSeason) return true
+  if (showSeason > 1) {
+    if (rs === showSeason) return true
+    if (rs != null) return false
+    if (markerTokens && markerTokens.size && resultMatchesShow(title, markerTokens, 1)) return true
+    return false
+  }
+  return !rs || rs === 1
+}
+
+// Year detection, used to disambiguate franchise siblings released in
+// different years. AniList often puts the year in the show's title itself
+// ("Vampire Hunter D (2000)", "Hunter x Hunter (2011)"), and release filenames
+// commonly include the year too ("Vampire.Hunter.D.1985.1080p..."). If the
+// show's own titles carry a year, we require any result that ALSO carries a
+// year to share it. Results with no year at all still pass (movie releases
+// often omit year in the filename). Shows with no year get no year check at
+// all, so this doesn't touch typical series matching.
+const YEAR_RE = /(?:^|[\s._\[(\-])(19[3-9]\d|20\d{2})(?=[\s._\])\-]|$)/g
+
+export function detectYears (text) {
+  const s = String(text || '')
+  const years = new Set()
+  YEAR_RE.lastIndex = 0
+  let m
+  while ((m = YEAR_RE.exec(s)) !== null) years.add(m[1])
+  return years
+}
+
+export function detectShowYears (titles) {
+  const years = new Set()
+  for (const t of titles || []) for (const y of detectYears(t)) years.add(y)
+  return years
+}
+
+export function resultMatchesYear (title, showYears) {
+  if (!showYears || !showYears.size) return true
+  const rYears = detectYears(title)
+  if (!rYears.size) return true
+  for (const y of rYears) if (showYears.has(y)) return true
+  return false
+}
+
+export function titleHasEpisode (title, ep) {
+  if (ep == null) return true
+  title = normalizeMatchTitle(title)
+  const n = String(ep).replace(/^0+/, '') || '0'
+  const patterns = [
+    new RegExp('\\b(?:e|ep|episode\\s*|s\\d{1,2}e)0*' + n + '\\b(?!\\d)', 'i'),
+    new RegExp('[\\s._][-~]\\s+0*' + n + '(?:v\\d)?(?=[\\s\\[\\(]|$)', 'i'),
+    new RegExp('[\\[\\(]0*' + n + '(?:v\\d)?[\\]\\)]', 'i')
+  ]
+  return patterns.some(re => re.test(title))
+}
+
+export function looksLikeBatch (title) {
+  title = normalizeMatchTitle(title)
+  if (/\bs\d{1,2}e\d{1,3}\s*[-~]\s*(?:s\d{1,2})?e?\d{1,3}\b/i.test(title)) return true
+  if (/\bs\d{1,2}e\d{1,3}\b/i.test(title)) return false
+  if (/\s-\s*\d{1,4}(?:v\d)?\s*(?:\[|\(|$)/.test(title)) return false
+  return BATCH_PATTERNS.some(re => re.test(title))
+}
+
+export function tagAccuracy (tier, dateMs, sourceDefault) {
+  if (tier === 'A') return sourceDefault
+  if (tier === 'B') return 'low'
+  const days = (Date.now() - (dateMs || 0)) / 86400000
+  if (days < 60) return sourceDefault
+  if (days < 180) return 'medium'
+  return 'low'
+}
+
+// Up to `limit` DISTINCT search strings for a show. Multiple AniList titles
+// often trim to the same query (every Bleach variant becomes "bleach"), which
+// used to fire the same request two or three times and waste the budget.
+//
+// When an episode is given, an episode-numbered query is appended. Feeds return
+// only their most recent page, so an older episode is invisible to the plain
+// title query; "frieren 08" is the only way to reach it. Results from it are
+// tiered like any other, so a stale batch it drags in cannot outrank a real
+// match.
+export function buildQueries (titles, opts = {}) {
+  const limit = opts.limit || 3
+  const bases = []
+  const seen = new Set()
+  for (const title of rankTitlesForQuery(titles || [])) {
+    if (bases.length >= limit) break
+    const q = trimTitleForQuery(title)
+    if (!q || seen.has(q)) continue
+    seen.add(q)
+    bases.push(q)
+    if (bases.length >= limit) break
+  }
+  // Every base title also gets an episode-numbered form, not just the first:
+  // groups name files after whichever title they prefer, so "meitantei conan
+  // 1100" finds nothing while "detective conan 1100" finds the episode. These
+  // are a second phase, not extra work up front, since a feed's recent page
+  // already holds the current episode of an airing show.
+  const rescue = []
+  for (const alias of aliasTitles(opts.anilistId)) {
+    const a = String(alias).trim()
+    if (!a || seen.has(a)) continue
+    seen.add(a)
+    rescue.push(a)
+  }
+  const epNumbers = []
+  if (opts.episodeCandidates && opts.episodeCandidates.size) {
+    for (const n of opts.episodeCandidates) epNumbers.push(n)
+  } else if (opts.episode != null) {
+    epNumbers.push(opts.episode)
+  }
+  const withEp = q => epNumbers.map(n => q + ' ' + pad(n))
+  const numbered = [
+    ...bases.flatMap(withEp),
+    ...rescue,
+    ...rescue.flatMap(withEp)
+  ]
+  return { bases, numbered }
+}
+
+// Fetch in two phases, stopping the moment the episode is found.
+//
+// The numbered queries are a second phase that only runs when the plain titles
+// did not turn up the episode, which for an airing show is never.
+//
+// Requests are sequential by default. Three sources read the same nyaa feed, so
+// firing each source's queries at once turns into a burst several times that
+// size, and nyaa answers with 429. It also gains nothing: nyaa serializes
+// requests per IP, so six at once measured 2.4s to 2.9s each against 0.5s each
+// in sequence. Sources on their own host pass parallel: true.
+export async function collectFeed (queries, fetchItems, mapItem, ctx, sourceDefault, opts = {}) {
+  const seen = new Set()
+  const collected = []
+  let shaped = []
+  let lastError = null
+
+  const absorb = items => {
+    for (const raw of items) {
+      const r = mapItem(raw)
+      if (!r || seen.has(r.hash)) continue
+      seen.add(r.hash)
+      collected.push(r)
+    }
+    shaped = shapeAll(collected, ctx, sourceDefault)
+  }
+  const foundEpisode = () => shaped.some(r => r._tier === 'A')
+
+  const phase = async (qs, stopWhenFound) => {
+    if (opts.parallel) {
+      const settled = await Promise.allSettled(qs.map(q => fetchItems(q)))
+      const ok = []
+      for (const s of settled) {
+        if (s.status === 'rejected') lastError = s.reason
+        else ok.push(s.value)
+      }
+      for (const items of ok) absorb(items)
+      return
+    }
+    for (const q of qs) {
+      try {
+        absorb(await fetchItems(q))
+      } catch (err) {
+        lastError = err
+        if (err && err.rateLimited) return
+        continue
+      }
+      if (stopWhenFound && foundEpisode()) return
+    }
+  }
+
+  // Every base title is searched. Stopping at the first one that matched costs
+  // real results: a show whose releases are split across two naming conventions
+  // only shows the half that happened to be queried first. The numbered round
+  // is different, it exists purely to reach an episode that fell off the feed,
+  // so the first query that finds it ends the round.
+  await phase(queries.bases, false)
+  if (!collected.length && lastError) throw lastError
+  if (queries.numbered.length && !foundEpisode()) await phase(queries.numbered, true)
+  if (!collected.length && lastError) throw lastError
+  return shaped
+}
+
+const ANILIST_API = 'https://graphql.anilist.co'
+const offsetCache = new Map()
+
+// AniList splits long shows into one entry per cour while release groups keep
+// numbering files continuously across the arc. "BLEACH: TYBW - The Calamity"
+// ep 1 is ep 41 on nyaa. Walking the PREQUEL chain and accumulating episode
+// counts recovers the offsets: 14 + 13 + 13 = 40, so 1 -> 41.
+//
+// The chain is followed past the arc boundary too (into the 366-episode 2004
+// series), because different groups pick different roots. Every cumulative sum
+// becomes a candidate, so whichever convention a group used still matches.
+const RELATION_NODE = 'id episodes format title{romaji english}'
+
+function nestedRelations (depth) {
+  let inner = RELATION_NODE
+  for (let i = 0; i < depth; i++) {
+    inner = RELATION_NODE + ' relations{edges{relationType node{' + inner + '}}}'
+  }
+  return inner
+}
+
+const CHAIN_QUERY = 'query($id:Int){Media(id:$id){episodes status startDate{year} nextAiringEpisode{episode} relations{edges{relationType node{' + nestedRelations(2) + '}}}}}'
+const STEP_QUERY = 'query($id:Int){Media(id:$id){episodes format status nextAiringEpisode{episode} relations{edges{relationType node{' + RELATION_NODE + '}}}}}'
+
+// undefined means the lookup failed and must not be cached. null means AniList
+// answered but has no such entry. A 429 returns immediately: AniList sends no
+// Retry-After and its window is around a minute, so retrying inside one search
+// only spends more of the budget that is already exhausted.
+async function anilistQuery (query, id) {
+  const body = JSON.stringify({ query, variables: { id } })
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await new Promise(r => setTimeout(r, 600 * attempt + Math.floor(Math.random() * 300)))
+    let res
+    try {
+      res = await fetch(ANILIST_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body
+      })
+    } catch {
+      continue
+    }
+    if (res.status === 429) return undefined
+    if (!res.ok) continue
+    let parsed
+    try {
+      parsed = JSON.parse(await res.text())
+    } catch {
+      continue
+    }
+    if (parsed && parsed.errors && !parsed.data) return undefined
+    const media = parsed && parsed.data && parsed.data.Media
+    return media || null
+  }
+  return undefined
+}
+
+function pickPrequel (node) {
+  const edges = (node && node.relations && node.relations.edges) || []
+  return edges
+    .filter(e => e.relationType === 'PREQUEL')
+    .map(e => e.node)
+    .filter(n => n && (n.format === 'TV' || n.format === 'ONA' || n.format === 'TV_SHORT'))
+    .sort((a, b) => (b.episodes || 0) - (a.episodes || 0))[0]
+}
+
+function prequelEntry (node) {
+  return {
+    episodes: node.episodes,
+    tokens: buildTitleTokens([node.title && node.title.romaji, node.title && node.title.english].filter(Boolean))
+  }
+}
+
+// AniList gives a next episode for a show that is running and for one that has
+// not premiered yet. Requiring RELEASING skipped the second case, which is
+// exactly premiere day: episode 1 of a new season is not out, and the feeds
+// still carry episode 1 of every earlier season under the same franchise name.
+function airingOf (media) {
+  if (media && media.nextAiringEpisode) {
+    const n = Number(media.nextAiringEpisode.episode)
+    if (Number.isInteger(n) && n > 0) return n
+  }
+  return null
+}
+
+// Asking hop by hop cost six requests per show per source, and Hayase runs five
+// sources at once, so one search spent about thirty of AniList's per-minute
+// budget and routinely hit its rate limit. A nested request covers the first
+// few hops at once. AniList stops filling in relations past roughly two levels,
+// so a chain longer than that continues hop by hop from where it ran out.
+async function fetchPrequelChain (anilistId) {
+  const root = await anilistQuery(CHAIN_QUERY, Number(anilistId))
+  if (root === undefined) return walkFrom(Number(anilistId), [], null, new Set())
+  if (!root) return { counts: [], nextAiring: null, ok: true }
+  const startYear = root.startDate && Number.isInteger(root.startDate.year) ? root.startDate.year : null
+
+  const nextAiring = airingOf(root)
+  const counts = []
+  const seen = new Set([Number(anilistId)])
+  let node = root
+  let lastId = Number(anilistId)
+  while (counts.length < 12) {
+    const prequel = pickPrequel(node)
+    if (!prequel || !prequel.episodes || seen.has(prequel.id)) break
+    counts.push(prequelEntry(prequel))
+    seen.add(prequel.id)
+    lastId = prequel.id
+    if (prequel.relations === undefined) break
+    node = prequel
+  }
+  if (!counts.length) return { counts, nextAiring, ok: true, startYear }
+  const rest = await walkFrom(lastId, counts, nextAiring, seen)
+  rest.startYear = startYear
+  return rest
+}
+
+async function walkFrom (startId, counts, nextAiring, seen) {
+  let ok = true
+  let current = startId
+  for (let depth = 0; depth < 12 && current; depth++) {
+    const media = await anilistQuery(STEP_QUERY, current)
+    if (media === undefined) {
+      ok = false
+      break
+    }
+    if (!media) break
+    if (depth === 0 && nextAiring == null) nextAiring = airingOf(media)
+    const prequel = pickPrequel(media)
+    if (!prequel || !prequel.episodes || seen.has(prequel.id)) break
+    counts.push(prequelEntry(prequel))
+    seen.add(prequel.id)
+    current = prequel.id
+  }
+  return { counts, nextAiring, ok }
+}
+
+// A lookup that failed is never kept. Caching it disabled the airing check and
+// the offset resolution for the rest of the session, which put a previous
+// cour's episode 9 in the picker for an episode that has not aired.
+async function getChain (anilistId) {
+  const key = String(anilistId)
+  if (!offsetCache.has(key)) {
+    offsetCache.set(key, fetchPrequelChain(anilistId).catch(() => ({ counts: [], nextAiring: null, ok: false })))
+  }
+  let chain
+  try {
+    chain = await offsetCache.get(key)
+  } catch {
+    chain = null
+  }
+  if (!chain || chain.ok === false) {
+    offsetCache.delete(key)
+    return { counts: [], nextAiring: null, ok: false }
+  }
+  return chain
+}
+
+function sharesSubSeries (showTokens, prequelTokens) {
+  if (!showTokens || !showTokens.size || !prequelTokens || !prequelTokens.size) return true
+  let shared = 0
+  for (const t of prequelTokens) if (showTokens.has(t)) shared++
+  return shared / showTokens.size >= 0.5
+}
+
+// AniList publishes the next episode due to air for a show still running. An
+// episode at or beyond that has not been released, so anything a feed offers
+// under that number belongs to some other cour that reused it.
+export async function episodeNotAired (query) {
+  const ep = Number(query.episode)
+  if (!Number.isInteger(ep) || !query.anilistId) return false
+  const chain = await getChain(query.anilistId)
+  const next = chain && chain.nextAiring
+  return Number.isInteger(next) && ep >= next
+}
+
+export async function resolveEpisodeCandidates (query) {
+  const ep = Number(query.episode)
+  if (!Number.isInteger(ep) || !query.anilistId) return null
+  const chain = await getChain(query.anilistId)
+  const candidates = new Set([ep])
+  const showTokens = buildTitleTokens(query.titles || [])
+  let running = 0
+  const list = (chain && chain.counts) || []
+  for (let i = 0; i < list.length; i++) {
+    const entry = list[i]
+    const count = typeof entry === 'number' ? entry : entry.episodes
+    const tokens = typeof entry === 'number' ? null : entry.tokens
+    if (!count) continue
+    const crossesRoot = !sharesSubSeries(showTokens, tokens)
+    // Emit before absorbing an entry that belongs to a different work. Release
+    // groups number continuously from the start of a titled run, so only the
+    // total of a complete run is a real convention. A partial sum through the
+    // middle of one points at an episode that exists but is not this one:
+    // BLEACH: The Calamity episode 7 was matching episode 34, which is
+    // episode 7 of the previous cour.
+    if (crossesRoot && running >= 10) candidates.add(ep + running)
+    running += count
+  }
+  if (running >= 10) candidates.add(ep + running)
+  return candidates
+}
+
+// A one-episode work has nothing else to tell it apart from a later remake or
+// series of the same name, and AniList only puts a year in the title of the
+// newer entry. False Memory the 2020 short and False Memory the 2026 series
+// both search as "false memory", so the short was listing the series. The start
+// year from AniList stands in for the year the title does not state, with a
+// year of slack either side for a release dated across New Year.
+function yearsForShow (titles, startYear, mode) {
+  const years = detectShowYears(titles)
+  if (years.size || mode !== 'movie' || !Number.isInteger(startYear)) return years
+  return new Set([String(startYear - 1), String(startYear), String(startYear + 1)])
+}
+
+export async function withShowFacts (query) {
+  try {
+    if (!query || !query.anilistId) return query
+    const chain = await getChain(query.anilistId)
+    if (chain && chain.ok && Number.isInteger(chain.startYear)) return { ...query, startYear: chain.startYear }
+  } catch {}
+  return query
+}
+
+export function searchContext (query, mode) {
+  const titles = query.titles || []
+  // Threshold comes from the canonical title alone. Taking it from the union of
+  // every synonym let foreign ones inflate the count: "One Piece" gained tokens
+  // from its Vietnamese and Italian names, demanding two hits from a title that
+  // only ever contains one, so no real release could match.
+  const primary = rankTitlesForQuery(titles)[0]
+  const primaryTokens = primary ? buildTitleTokens([primary]) : new Set()
+  return {
+    mode,
+    showTokens: buildTitleTokens(titles),
+    nativeKeys: nativeKeys(titles),
+    notAired: !!query.notAired,
+    chainSeason: query.chainSeason || null,
+    showSeason: detectShowSeason(titles),
+    seasonMarks: seasonMarkerTokens(titles),
+    showYears: yearsForShow(titles, query.startYear, mode),
+    minHits: primaryTokens.size >= 3 ? 2 : 1,
+    episode: query.episode,
+    episodeCandidates: query.episodeCandidates || null,
+    exclusions: query.exclusions || [],
+    resolution: query.resolution || ''
+  }
+}
+
+// Tier + age-tag a raw result. Returns null when it is not this show.
+export function shapeResult (r, ctx, sourceDefault) {
+  const tier = classifyResult(r.title, ctx)
+  if (tier === null) return null
+  const out = { ...r, _tier: tier, accuracy: tagAccuracy(tier, r.date?.getTime?.(), sourceDefault) }
+  if (tier === 'B' || looksLikeBatch(r.title)) out.type = 'batch'
+  return out
+}
+
+// Shape every result under both numbering schemes and keep the better one.
+//
+// A per-cour entry has two plausible readings of "episode 1": the literal one,
+// and ep 41 of the continuous arc. Both usually find something, since an older
+// cour also has an "01" file, so presence alone cannot decide. Recency can: the
+// episode the user is asking for is the one that was just uploaded, while the
+// rival reading only turns up a years-old file from a finished cour.
+export function shapeAll (items, ctx, sourceDefault) {
+  const shape = c => {
+    const out = []
+    for (const r of items) {
+      const s = shapeResult(r, c, sourceDefault)
+      if (s) out.push(s)
+    }
+    return out
+  }
+  const exact = shape({ ...ctx, episodeCandidates: null })
+  if (ctx.episode != null) ctx.chosenEpisodes = new Set([ctx.episode])
+  if (!ctx.episodeCandidates || ctx.episodeCandidates.size <= 1) return exact
+
+  // Only one candidate can be right. Each cour boundary in the chain produces
+  // one, so The Calamity ep 1 could read as 1, 15, 28, 41 or 407, and accepting
+  // all of them let a two-year-old ep 28 sit beside today's ep 41. Score each
+  // on its own and keep the single freshest: the episode being asked for is the
+  // one that was just uploaded.
+  const scored = []
+  for (const n of ctx.episodeCandidates) {
+    const shaped = shape({ ...ctx, episodeCandidates: new Set([n]) })
+    const newest = newestOf(shaped)
+    if (newest == null) continue
+    scored.push({ newest, shaped, episode: n })
+  }
+  if (!scored.length) return exact
+  let best = scored[0]
+  for (const c of scored) if (c.newest > best.newest) best = c
+  const kept = scored.filter(c => best.newest - c.newest <= CANDIDATE_WINDOW_MS)
+  const chosen = new Set(kept.map(c => c.episode))
+  ctx.chosenEpisodes = chosen
+  ctx.offsetResolved = !chosen.has(ctx.episode)
+  if (kept.length === 1) return best.shaped
+  const merged = new Map()
+  for (const c of kept) {
+    for (const r of c.shaped) {
+      const prev = merged.get(r.hash)
+      if (!prev || r._tier < prev._tier) merged.set(r.hash, r)
+    }
+  }
+  return [...merged.values()]
+}
+
+const CANDIDATE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+
+function newestOf (results) {
+  let newest = null
+  for (const r of results) {
+    if (r._tier !== 'A') continue
+    const t = r.date?.getTime?.() || 0
+    if (newest == null || t > newest) newest = t
+  }
+  return newest
+}
+
+// Newest first. Exact-episode matches lead only when some exist, so per-cour
+// entries (where no filename maps to the AniList episode number) still put the
+// freshest upload on top instead of a years-old batch.
+function timeOf (r) {
+  const t = r.date && typeof r.date.getTime === 'function' ? r.date.getTime() : 0
+  return Number.isFinite(t) ? t : 0
+}
+
+function qualityRank (r) {
+  if (r._remake) return 2
+  if (r._trusted) return 0
+  return 1
+}
+
+export function sortResults (results, resolution) {
+  const hasExact = results.some(r => r._tier === 'A')
+  const sorted = results.slice()
+  return sorted.sort((a, b) => {
+    if (hasExact && a._tier !== b._tier) return a._tier < b._tier ? -1 : 1
+    if (resolution) {
+      const am = matchesResolution(a.title, resolution) ? 1 : 0
+      const bm = matchesResolution(b.title, resolution) ? 1 : 0
+      if (am !== bm) return bm - am
+    }
+    if (!hasExact) {
+      const dt = timeOf(b) - timeOf(a)
+      if (dt !== 0) return dt
+    }
+    const qr = qualityRank(a) - qualityRank(b)
+    if (qr !== 0) return qr
+    const sd = (b.seeders || 0) - (a.seeders || 0)
+    if (sd !== 0) return sd
+    return timeOf(b) - timeOf(a)
+  })
+}
+
+// Episode numbers a filename states outright, as [from, to] pairs so a range
+// covers everything inside it. Only high-confidence forms are read: a title
+// with no recognizable marker yields nothing and is never treated as wrong.
+export function titleEpisodeMarkers (title) {
+  title = normalizeMatchTitle(title)
+  const out = []
+  const push = (a, b) => {
+    const lo = parseInt(a, 10)
+    const hi = b == null ? lo : parseInt(b, 10)
+    if (Number.isInteger(lo)) out.push([lo, Number.isInteger(hi) ? hi : lo])
+  }
+  let m
+  const se = /\bs\d{1,2}e(\d{1,4})(?:\s*[-~]\s*(?:s\d{1,2})?e(\d{1,4}))?\b/gi
+  while ((m = se.exec(title)) !== null) push(m[1], m[2])
+  const ep = /\bep(?:isode)?\.?\s*(\d{1,4})\b/gi
+  while ((m = ep.exec(title)) !== null) push(m[1], null)
+  const dash = /[\s._]-\s*(\d{1,4})(?:v\d)?\s*(?=[[(]|$)/g
+  while ((m = dash.exec(title)) !== null) push(m[1], null)
+  const range = /\b(\d{1,4})\s*[-~]\s*(\d{1,4})\b/g
+  while ((m = range.exec(title)) !== null) {
+    const a = parseInt(m[1], 10)
+    const b = parseInt(m[2], 10)
+    if (b > a && b - a < 400) push(m[1], m[2])
+  }
+  return out
+}
+
+// True when the filename names an episode and none of them is the one wanted.
+// A dub source sitting on ep 2 while ep 4 is being asked for is not a weaker
+// match for ep 4, it is a different episode, and Hayase merges every source
+// into one list where it would sit beside the real thing.
+export function hasConflictingEpisode (title, wanted) {
+  if (!wanted || !wanted.size) return false
+  const markers = titleEpisodeMarkers(title)
+  if (!markers.length) return false
+  for (const [lo, hi] of markers) {
+    for (const w of wanted) if (w >= lo && w <= hi) return false
+  }
+  return true
+}
+
+// Title-only matches are dropped once a real episode match exists: they are
+// other episodes of the same show, which is noise when a specific one was
+// asked for.
+//
+// When nothing matched, what is left is a guess, so it is capped at low
+// accuracy: another source that did find the episode has to outrank it in the
+// merged picker. Guesses that name a different episode outright are dropped
+// outright. Ones with no episode in the name (packs, movies, unlabelled rips)
+// stay, which is what keeps the picker from going empty.
+const JUST_RELEASED_MS = 7 * 24 * 60 * 60 * 1000
+
+export function finalize (results, ctx, limit = 30) {
+  const resolution = typeof ctx === 'string' ? ctx : (ctx && ctx.resolution) || ''
+  const hasExact = results.some(r => r._tier === 'A')
+  let kept
+  // AniList's schedule is the broadcast time, and release groups beat it: on
+  // premiere day Tokyo Revengers season 4 was on nyaa over an hour before
+  // AniList called it aired. So the schedule only decides what happens when
+  // nothing real turned up. A freshly uploaded exact match is believed over
+  // it, while a years-old file that happens to carry the same episode number,
+  // which is the whole reason the check exists, still cannot get through.
+  if (ctx && typeof ctx !== 'string' && ctx.notAired) {
+    const now = Date.now()
+    const fresh = results.filter(r => {
+      if (r._tier !== 'A') return false
+      const t = r.date && typeof r.date.getTime === 'function' ? r.date.getTime() : 0
+      return Number.isFinite(t) && now - t <= JUST_RELEASED_MS
+    })
+    if (!fresh.length) return []
+    return sortResults(fresh, resolution).slice(0, limit).map(stripInternal)
+  }
+  if (hasExact) {
+    kept = results.filter(r => r._tier !== 'C')
+  } else {
+    const wanted = typeof ctx === 'string' ? null : wantedEpisodes(ctx)
+    const showSeason = typeof ctx === 'string' || (ctx && ctx.offsetResolved) ? null : ctx.showSeason
+    kept = results
+      .filter(r => !hasConflictingEpisode(r.title, wanted))
+      // A season the filename states outright and does not share with the show
+      // is the same kind of mismatch: asking for season 4 was turning up a dub
+      // sitting on S03E12 and season 1 to 3 Bluray packs. Titles that name no
+      // season still pass.
+      .filter(r => resultMatchesSeason(r.title, showSeason, typeof ctx === 'string' ? null : ctx.seasonMarks, typeof ctx === 'string' ? null : ctx.chainSeason))
+      .map(r => ({ ...r, accuracy: 'low' }))
+  }
+  return sortResults(kept, resolution).slice(0, limit).map(stripInternal)
+}
+
+export function stripInternal (r) {
+  const out = {}
+  for (const k of Object.keys(r)) {
+    if (k.charCodeAt(0) === 95) continue
+    out[k] = r[k]
+  }
+  return out
+}
+
+function wantedEpisodes (ctx) {
+  if (!ctx || ctx.mode !== 'single' || ctx.episode == null) return null
+  return ctx.chosenEpisodes || new Set([ctx.episode])
+}
+
+// Attach absolute-numbering candidates so per-cour entries match the filenames
+// release groups actually use. Never throws: a failed lookup leaves the query
+// untouched and matching falls back to the AniList episode number alone.
+export async function withEpisodeCandidates (query) {
+  try {
+    const episodeCandidates = await resolveEpisodeCandidates(query)
+    const notAired = await episodeNotAired(query)
+    const chain = await getChain(query.anilistId)
+    const chainSeason = chain && chain.ok && chain.counts.length ? chain.counts.length + 1 : null
+    let out = query
+    if (notAired) out = { ...out, notAired: true }
+    if (chainSeason) out = { ...out, chainSeason }
+    if (chain && chain.ok && Number.isInteger(chain.startYear)) out = { ...out, startYear: chain.startYear }
+    if (!episodeCandidates || episodeCandidates.size <= 1) return out
+    return { ...out, episodeCandidates }
+  } catch {
+    return query
+  }
+}
+
+// Common English words that are too broad to be a useful standalone search
+// query (a synonym like "Monster #8" or romaji that strips to "Level" would
+// otherwise drag in every unrelated show containing the word). Only used to
+// DEMOTE such a title when the show has a better one; if it is the only title,
+// it is still used. Distinct from STOPWORDS (which are dropped from matching).
+export const GENERIC_QUERY_WORDS = new Set([
+  'monster', 'level', 'hero', 'world', 'girl', 'boy', 'demon', 'devil',
+  'dragon', 'angel', 'king', 'queen', 'story', 'magic', 'school', 'love',
+  'life', 'club', 'sword', 'blood', 'dark', 'light', 'night', 'master',
+  'star', 'moon', 'witch', 'ghost', 'dead', 'zombie', 'idol', 'club'
+])
+
+export function trimTitleForQuery (title) {
+  const original = String(title || '')
+  const stripped = original.replace(/\s*[(\[]\s*(?:19|20)\d{2}\s*[)\]]\s*$/, '').trim()
+  const raw = stripped || original
+  const colon = raw.indexOf(':')
+  const base = colon > 0 ? raw.slice(0, colon) : raw
+  const fromBase = significantTokens(base).slice(0, 4).join(' ')
+  if (fromBase) return fromBase
+  // The part before the colon can be too short to search on its own, as in
+  // "Re:Zero" or "K:Return of Kings". Falling back to the raw title sent the
+  // whole thing as one query, and nyaa requires every word to match, so only
+  // groups using that exact phrasing came back. ToonsHub names the same show
+  // "ReZERO -Starting Life in Another World-" and matched nothing at all.
+  //
+  // The fallback keeps the title's own leading words rather than its
+  // significant tokens. Dropping stopwords here searched a synonym like
+  // "DAN DA DAN: FIRST ENCOUNTER" as "first encounter", which is generic
+  // enough to return unrelated shows. Keeping the words yields a query that
+  // simply finds nothing when it is wrong, which is the safer failure.
+  const baseWords = escapeQuery(base).split(/\s+/).filter(Boolean)
+  const usePreColon = baseWords.length >= 2
+  const source = usePreColon ? baseWords : escapeQuery(raw).split(/\s+/).filter(Boolean)
+  const trimmed = source.slice(0, 4)
+  if (!usePreColon) {
+    while (trimmed.length > 1 && STOPWORDS.has(trimmed[trimmed.length - 1].toLowerCase())) trimmed.pop()
+  }
+  const words = trimmed.join(' ')
+  return words || escapeQuery(raw)
+}
+
+export function rankTitlesForQuery (titles) {
+  const list = (titles || [])
+    .filter(t => typeof t === 'string' && t.trim())
+    .map((t, i) => {
+      const stripped = String(t).replace(/\s/g, '')
+      const ascii = escapeQuery(t).replace(/\s/g, '')
+      const queryToks = trimTitleForQuery(t).split(/\s+/).filter(Boolean)
+      return {
+        t,
+        i,
+        tokens: significantTokens(t).length,
+        // A query is "degenerate" when it collapses to a single word that is
+        // too generic to search: very short ("Orb: ..." -> "orb") or a common
+        // word ("Ore dake Level Up na Ken" -> "level", "Monster #8" -> "monster").
+        // A specific single token ("bakemonogatari", "noragami", "kaiju") is
+        // fine. Degenerate titles get demoted so a better title is queried first.
+        degenerate: queryToks.length <= 1 &&
+          ((queryToks[0] || '').length < 4 || GENERIC_QUERY_WORDS.has(queryToks[0])),
+        asciiRatio: stripped.length ? ascii.length / stripped.length : 0
+      }
+    })
+    .filter(x => x.tokens > 0)
+
+  // Prefer mostly-Latin titles (romaji / english) over heavily transliterated
+  // foreign synonyms; fall back to all titles if every one is foreign so the
+  // show still searches something (never return zero -> Witch Hat bug).
+  const latin = list.filter(x => x.asciiRatio >= 0.5)
+  const pool = latin.length ? latin : list
+
+  // Then KEEP THE ORIGINAL ORDER. AniList and Hayase provide the canonical
+  // romaji and english titles first and the foreign synonyms / acronyms /
+  // descriptive translations ("HxH", "Monster #8", "Stray God", "Atelier
+  // spiczastych kapeluszy") last, and the canonical titles are what release
+  // groups actually name files after. Reordering by token length or "cleverer"
+  // heuristics is what promoted foreign synonyms to the top and made shows like
+  // Witch Hat Atelier search a Polish title and return nothing. The only
+  // reordering is pushing degenerate single-word queries to the back.
+  return pool
+    .sort((a, b) => (a.degenerate - b.degenerate) || (a.i - b.i))
+    .map(x => x.t)
+}
+
+export function pad (n) {
+  const s = String(n)
+  return s.length < 2 ? '0' + s : s
+}
+
+// Tier a token-matched result for picker ordering. Mirrors the way nyaa's own
+// search behaves (date-desc within relevance tiers) so per-cour AniList entries
+// like BLEACH: The Calamity surface today's E41 uploads at the top instead of
+// being buried under 2-year-old batches whose range happens to contain "01".
+//
+// Returns null if the result should not appear at all (token or exclusion fail).
+// Returns 'A' | 'B' | 'C' where A ranks first:
+//   A = passes season+year AND (single-episode match | movie mode | batch mode)
+//   B = passes season+year but is a batch containing the requested ep in single mode
+//   C = token-only match (season/year/episode mismatch) - fallback
+export function usesOffsetEpisode (opts) {
+  const c = opts && opts.episodeCandidates
+  return !!(c && c.size === 1 && opts.episode != null && !c.has(opts.episode))
+}
+
+function batchCoversEpisode (title, opts) {
+  const wanted = []
+  const c = opts.episodeCandidates
+  if (c && c.size) for (const n of c) wanted.push(n)
+  else if (opts.episode != null) wanted.push(opts.episode)
+  if (!wanted.length) return false
+  const markers = titleEpisodeMarkers(title)
+  for (const [lo, hi] of markers) {
+    if (hi <= lo) continue
+    for (const w of wanted) if (w >= lo && w <= hi) return true
+  }
+  return false
+}
+
+export function classifyResult (title, opts) {
+  title = normalizeMatchTitle(title)
+  const showTokens = opts.showTokens
+  const minHits = opts.minHits != null ? opts.minHits : (showTokens && showTokens.size >= 3 ? 2 : 1)
+  // A release that carries the show's Japanese name is the show, whatever Latin
+  // words sit next to it, so it skips the token checks that guard Latin names.
+  const native = matchesNative(title, opts.nativeKeys)
+  if (!native && !resultMatchesShow(title, showTokens, minHits)) return null
+  if (!native && showTokens && showTokens.size === 1 && nameIntroducesForeignWord(title, showTokens)) return null
+  const marks = opts.seasonMarks
+  if (!native && marks && marks.size && !resultMatchesShow(title, marks, 1) && nameIntroducesForeignWord(title, showTokens)) {
+    return null
+  }
+  const offset = usesOffsetEpisode(opts)
+  const seasonOk = offset || resultMatchesSeason(title, opts.showSeason, opts.seasonMarks, opts.chainSeason)
+  const yearOk = resultMatchesYear(title, opts.showYears)
+  const isBatch = looksLikeBatch(title)
+  if (opts.mode === 'batch') {
+    return (seasonOk && yearOk && isBatch) ? 'A' : 'C'
+  }
+  if (opts.mode === 'movie') {
+    const marker = String(title).match(/\bS(\d{1,2})(?:E\d{1,4}|\b)/i)
+    if (marker && parseInt(marker[1], 10) >= 1) return null
+    if (titleEpisodeMarkers(title).some(([lo, hi]) => hi > lo || lo > 1)) return null
+    return (seasonOk && yearOk) ? 'A' : 'C'
+  }
+  const epOk = opts.episode == null || matchesAnyEpisode(title, opts)
+  if (seasonOk && yearOk && epOk) {
+    return isBatch ? 'B' : 'A'
+  }
+  if (seasonOk && yearOk && isBatch && batchCoversEpisode(title, opts)) return 'B'
+  return 'C'
+}
+
+function matchesAnyEpisode (title, opts) {
+  const candidates = opts.episodeCandidates
+  if (candidates && candidates.size) {
+    for (const n of candidates) if (titleHasEpisode(title, n)) return true
+    return false
+  }
+  return titleHasEpisode(title, opts.episode)
+}
+
+export function matchesResolution (title, resolution) {
+  if (!resolution) return true
+  return title.includes(resolution + 'p') || title.includes(resolution)
+}
+
+export function hitsExclusion (title, exclusions) {
+  if (!exclusions || !exclusions.length) return false
+  const lower = title.toLowerCase()
+  return exclusions.some(kw => kw && lower.includes(String(kw).toLowerCase()))
+}
+
+export function buildMagnet (hash, name) {
+  const trackers = TRACKERS.map(t => 'tr=' + encodeURIComponent(t)).join('&')
+  const dn = name ? '&dn=' + encodeURIComponent(name) : ''
+  return 'magnet:?xt=urn:btih:' + String(hash).toLowerCase() + dn + '&' + trackers
+}
+
+export function parseSize (text) {
+  if (!text) return 0
+  const m = text.match(/([\d.]+)\s*(KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)/i)
+  if (!m) return 0
+  const value = parseFloat(m[1])
+  const unit = m[2].toLowerCase()
+  const mult = {
+    b: 1,
+    kib: 1024, kb: 1000,
+    mib: 1024 ** 2, mb: 1000 ** 2,
+    gib: 1024 ** 3, gb: 1000 ** 3,
+    tib: 1024 ** 4, tb: 1000 ** 4
+  }[unit] || 1
+  return Math.round(value * mult)
+}
+
+export function decodeEntities (str) {
+  return String(str)
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+export function pickTag (xml, tag) {
+  const open = '<' + tag + '>'
+  const close = '</' + tag + '>'
+  const i = xml.indexOf(open)
+  if (i === -1) return ''
+  const j = xml.indexOf(close, i + open.length)
+  if (j === -1) return ''
+  let val = xml.slice(i + open.length, j)
+  if (val.startsWith('<![CDATA[') && val.endsWith(']]>')) {
+    val = val.slice(9, -3)
+  }
+  return decodeEntities(val).trim()
+}
+
+export function pickItems (xml) {
+  const out = []
+  let cursor = 0
+  while (true) {
+    const start = xml.indexOf('<item>', cursor)
+    if (start === -1) break
+    const end = xml.indexOf('</item>', start)
+    if (end === -1) break
+    out.push(xml.slice(start + 6, end))
+    cursor = end + 7
+  }
+  return out
+}
